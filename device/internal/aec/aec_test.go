@@ -21,6 +21,30 @@ func synth(n int) []int16 {
 	return out
 }
 
+// synthAt scales synth to a target RMS. synth's own level (~2000 RMS) is 17dB
+// below what the speaker actually plays — TTS reads ~3000–6000 RMS on the
+// loopback — and speex's float build regularises its step size in absolute
+// int16 units, so a far end that quiet converges several times slower than
+// the device ever sees. Tests that model the field use this.
+func synthAt(n int, targetRMS float64) []int16 {
+	out := synth(n)
+	var sum float64
+	for _, v := range out {
+		sum += float64(v) * float64(v)
+	}
+	k := targetRMS / math.Sqrt(sum/float64(len(out)))
+	for i, v := range out {
+		f := float64(v) * k
+		if f > 32767 {
+			f = 32767
+		} else if f < -32768 {
+			f = -32768
+		}
+		out[i] = int16(f)
+	}
+	return out
+}
+
 // to48kStereo expands 16k mono to 48k stereo S16LE bytes by 3× sample
 // repetition — the canceller's mean-of-3 decimator then reproduces the
 // original exactly, so the test controls the post-decimation reference.
@@ -523,5 +547,199 @@ func TestRefSourceNamesTheLiveReference(t *testing.T) {
 	c.SetParams(false, 0, 300)
 	if got := c.RefSource(); got != "off" {
 		t.Fatalf("disarmed while on hardware: got %q, want \"off\"", got)
+	}
+}
+
+// The near-end headroom (2026-09-24). At high playback levels the +24dB mic
+// gain clips the speaker's echo at int16 before the canceller sees it, and
+// that clamp — not the loudspeaker — is what took cancellation from 12–16dB
+// at index 70 to 0–6dB above ~100 on a 2nd-gen Dot. The headroom is the
+// part of the gain unity playback would not tolerate.
+func TestNearHeadroomFollowsGainAndLevel(t *testing.T) {
+	for _, tc := range []struct {
+		gainDb, level int
+		wantDb        float64
+	}{
+		{24, 127, -24},                       // unity volume: the whole gain
+		{24, nearHeadroomFloorLevel, 0},      // 79: none needed from here down
+		{24, 47, 0},                          // the button floor
+		{24, 103, -12},                       // halfway
+		{24, 110, -15.5},                     // where the field log read mic≈13000
+		{0, 127, 0},                          // no gain, nothing to give back
+		{12, 127, -12},
+		{12, 103, 0},
+	} {
+		c := New()
+		c.SetParams(true, 0, 200)
+		c.SetHardwareRef(true)
+		c.SetNearGain(tc.gainDb)
+		c.SetPlaybackLevel(tc.level)
+		got := 20 * math.Log10(c.NearHeadroom())
+		if math.Abs(got-tc.wantDb) > 0.01 {
+			t.Errorf("gain %ddB level %d → headroom %.2fdB, want %.2fdB",
+				tc.gainDb, tc.level, got, tc.wantDb)
+		}
+	}
+
+	// Unknown level: nothing is scaled, so nothing may be scaled.
+	c := New()
+	c.SetParams(true, 0, 200)
+	c.SetHardwareRef(true)
+	c.SetNearGain(24)
+	if h := c.NearHeadroom(); h != 1 {
+		t.Errorf("headroom before any playback level: %.3f, want 1", h)
+	}
+	// Software tap: its reference is never scaled, so no headroom either.
+	c.SetPlaybackLevel(127)
+	c.SetHardwareRef(false)
+	if h := c.NearHeadroom(); h != 1 {
+		t.Errorf("headroom on the software tap: %.3f, want 1", h)
+	}
+	// Disabled: 1, so a caller applying it blindly changes nothing.
+	c.SetParams(false, 0, 200)
+	if h := c.NearHeadroom(); h != 1 {
+		t.Errorf("headroom while disabled: %.3f, want 1", h)
+	}
+}
+
+// TestNearHeadroomCancelsWhereTheMicWouldClip reproduces the volume ceiling:
+// an echo path whose gain, at +24dB, puts the near end well past int16 —
+// clamped exactly as beamformer.extractChannel clamps it — and shows that
+// the canceller cannot cancel that, while the same path run at the headroom
+// (near end scaled by the caller, reference scaled inside) cancels deeply
+// and restores to the same level.
+func TestNearHeadroomCancelsWhereTheMicWouldClip(t *testing.T) {
+	const frames = 250
+	const echoDelay = 33
+	// The loopback carries TTS at ~5000 RMS; at index 127 and +24dB the
+	// field log's near end extrapolates to ~35000 RMS, above full scale.
+	const farRMS = 5000.0
+	const pathGain = 7.0
+
+	run := func(useHeadroom bool) (att float64, clipped int) {
+		c := New()
+		c.SetParams(true, 0, 200)
+		c.SetHardwareRef(true)
+		c.SetNearGain(24)
+		c.SetPlaybackLevel(127)
+		h := 1.0
+		if useHeadroom {
+			h = c.NearHeadroom()
+			if h >= 1 {
+				t.Fatal("no headroom at +24dB and unity volume")
+			}
+		}
+		signal := synthAt(frames*FrameSize, farRMS)
+		var echoRMS, residRMS float64
+		measured := 0
+		for f := 0; f < frames; f++ {
+			lo, hi := f*FrameSize, (f+1)*FrameSize
+			mic := make([]int16, FrameSize)
+			for i := range mic {
+				src := lo + i - echoDelay
+				if src < 0 {
+					continue
+				}
+				// The mic goroutine's extraction: gain × headroom, then
+				// the int16 clamp.
+				v := -float64(signal[src]) * pathGain * h
+				if v > 32767 {
+					v = 32767
+					clipped++
+				} else if v < -32768 {
+					v = -32768
+					clipped++
+				}
+				mic[i] = int16(v)
+			}
+			micBytes := toBytes(mic)
+			out := c.ProcessWithRef(micBytes, toBytes(signal[lo:hi]))
+			if f >= frames-40 {
+				// Both restored by 1/h, as the caller does.
+				echoRMS += rms(micBytes) / h
+				residRMS += rms(out) / h
+				measured++
+			}
+		}
+		echoRMS /= float64(measured)
+		residRMS /= float64(measured)
+		return 20 * math.Log10(echoRMS / math.Max(residRMS, 1e-9)), clipped
+	}
+
+	attWith, clipWith := run(true)
+	attWithout, clipWithout := run(false)
+	t.Logf("clipped near end: %.1fdB (%d samples clamped); at the headroom: %.1fdB (%d clamped)",
+		attWithout, clipWithout, attWith, clipWith)
+	if clipWithout == 0 {
+		t.Fatal("the unscaled near end did not clip — the test is not exercising the fault")
+	}
+	if clipWith != 0 {
+		t.Fatalf("near end still clipped at the headroom: %d samples", clipWith)
+	}
+	if attWith < 15 {
+		t.Fatalf("at the headroom the canceller reached only %.1fdB", attWith)
+	}
+	if attWithout > attWith-6 {
+		t.Fatalf("clipping did not hurt: %.1fdB clipped against %.1fdB at the headroom",
+			attWithout, attWith)
+	}
+}
+
+// TestNearHeadroomLeavesTheFilterUnchanged pins the whole point of scaling
+// both sides: a filter converged at one headroom must still cancel at
+// another, because the echo path it learnt is the same. Otherwise every
+// volume change past the floor would be a fresh cold start.
+func TestNearHeadroomLeavesTheFilterUnchanged(t *testing.T) {
+	const frames = 300
+	const changeAt = 250
+	const echoDelay = 33
+	const farRMS = 5000.0
+	const pathGain = 2.0 // no clipping at either headroom: isolates the filter
+
+	c := New()
+	c.SetParams(true, 0, 200)
+	c.SetHardwareRef(true)
+	c.SetNearGain(24)
+	c.SetPlaybackLevel(127) // -24dB headroom
+	signal := synthAt(frames*FrameSize, farRMS)
+	var before, after float64
+	nb, na := 0, 0
+	for f := 0; f < frames; f++ {
+		if f == changeAt {
+			c.SetPlaybackLevel(103) // -12dB headroom; the reference also halves in level
+		}
+		h := c.NearHeadroom()
+		// The speaker really is quieter at 103: 24 steps of 0.5dB.
+		acoustic := 1.0
+		if f >= changeAt {
+			acoustic = math.Pow(10, -12.0/20)
+		}
+		lo, hi := f*FrameSize, (f+1)*FrameSize
+		mic := make([]int16, FrameSize)
+		for i := range mic {
+			if src := lo + i - echoDelay; src >= 0 {
+				mic[i] = int16(-float64(signal[src]) * pathGain * acoustic * h)
+			}
+		}
+		micBytes := toBytes(mic)
+		out := c.ProcessWithRef(micBytes, toBytes(signal[lo:hi]))
+		att := 20 * math.Log10(rms(micBytes) / math.Max(rms(out), 1e-9))
+		switch {
+		case f >= changeAt-10 && f < changeAt:
+			before += att
+			nb++
+		case f >= changeAt && f < changeAt+10:
+			after += att
+			na++
+		}
+	}
+	before /= float64(nb)
+	after /= float64(na)
+	t.Logf("attenuation before the headroom change %.1fdB, in the 10 frames after %.1fdB", before, after)
+	if before < 15 {
+		t.Fatalf("did not converge before the change: %.1fdB", before)
+	}
+	if after < before-3 {
+		t.Fatalf("the headroom change cost the filter its convergence: %.1fdB → %.1fdB", before, after)
 	}
 }

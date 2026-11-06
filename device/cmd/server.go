@@ -1076,6 +1076,9 @@ func applyAecConfig(canceller *aec.Canceller, dataClient *client.DataClient) {
 		delayMs = *snap.AecDelayMs
 	}
 	canceller.SetParams(enabled, delayMs, snap.AecTailMs)
+	if snap.AecResidualDb != nil {
+		canceller.SetResidualSuppression(*snap.AecResidualDb)
+	}
 	// The reference SOURCE lives on the data client, not the canceller: it
 	// is the mic goroutine that extracts ch8 and decides per period whether
 	// to hand it over, so that goroutine has to own the switch.

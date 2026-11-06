@@ -1,6 +1,7 @@
 package aec
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -35,25 +36,51 @@ func (c *Canceller) SetStatePath(path string) {
 	c.statePath = path
 }
 
+// nearStatePath is the file for one mic's echo path, beside the main one.
+func (c *Canceller) nearStatePath(ch int) string {
+	return fmt.Sprintf("%s.ch%d", c.statePath, ch)
+}
+
 // loadStateLocked loads the saved echo path into a freshly built
-// hardware-path filter. One small file read, once per boot.
+// hardware-path filter, and the per-mic paths into their parking slots
+// (SelectNear), so a mic the lock picks cancels from its first frames after a
+// restart too. A few small file reads, once per boot.
 func (c *Canceller) loadStateLocked() {
 	if c.statePath == "" || !c.hwRef || c.st == nil {
 		return
 	}
 	b, err := os.ReadFile(c.statePath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("[aec] saved echo path unreadable, starting cold: %v", err)
+	switch {
+	case err != nil && !os.IsNotExist(err):
+		log.Printf("[aec] saved echo path unreadable, starting cold: %v", err)
+	case err != nil:
+	default:
+		// importLocked, not ImportState: the lock is already held.
+		if err := c.importLocked(b); err != nil {
+			log.Printf("[aec] saved echo path refused, starting cold: %v", err)
+		} else {
+			log.Printf("[aec] loaded the saved echo path (%d bytes)", len(b))
 		}
-		return
 	}
-	// importLocked, not ImportState: the lock is already held.
-	if err := c.importLocked(b); err != nil {
-		log.Printf("[aec] saved echo path refused, starting cold: %v", err)
-		return
+	loaded := 0
+	for ch := 0; ch <= maxNearCh; ch++ {
+		b, err := os.ReadFile(c.nearStatePath(ch))
+		if err != nil {
+			continue
+		}
+		if err := c.checkLocked(b); err != nil {
+			log.Printf("[aec] saved echo path for ch%d refused: %v", ch, err)
+			continue
+		}
+		if c.nearStates == nil {
+			c.nearStates = make(map[int][]byte)
+		}
+		c.nearStates[ch] = b
+		loaded++
 	}
-	log.Printf("[aec] loaded the saved echo path (%d bytes)", len(b))
+	if loaded > 0 {
+		log.Printf("[aec] loaded the saved echo paths of %d mic(s)", loaded)
+	}
 }
 
 // maybeSaveLocked is called once per attenuation window. The export is a
@@ -63,15 +90,27 @@ func (c *Canceller) maybeSaveLocked(attDb float64, playing bool) {
 	if c.statePath == "" || !c.hwRef || !playing || attDb < saveMinDb {
 		return
 	}
-	if !c.lastSaveTry.IsZero() && time.Since(c.lastSaveTry) < saveEvery {
+	if c.lastSaveTry.IsZero() || time.Since(c.lastSaveTry) >= saveEvery {
+		c.lastSaveTry = time.Now()
+		if b, err := c.exportLocked(); err == nil {
+			go writeState(c.statePath, b, attDb)
+		}
+	}
+	// The mic this was learnt on gets its own file, on the same terms: the
+	// first time it converges, then daily. Seven files at most.
+	if c.nearCh < 0 || c.nearCh > maxNearCh {
 		return
 	}
-	c.lastSaveTry = time.Now()
-	b, err := c.exportLocked()
-	if err != nil {
+	if last, ok := c.lastNearSave[c.nearCh]; ok && time.Since(last) < saveEvery {
 		return
 	}
-	go writeState(c.statePath, b, attDb)
+	if c.lastNearSave == nil {
+		c.lastNearSave = make(map[int]time.Time)
+	}
+	c.lastNearSave[c.nearCh] = time.Now()
+	if b, err := c.exportLocked(); err == nil {
+		go writeState(c.nearStatePath(c.nearCh), b, attDb)
+	}
 }
 
 func writeState(path string, b []byte, attDb float64) {

@@ -78,13 +78,18 @@ func main() {
 		pc.SetParams(true, 0, *tail)
 		pc.SetHardwareRef(true)
 		pc.SetPlaybackLevel(*level)
+		pc.SetNearGain(int(math.Round(*gainDb)))
+		ph := pc.NearHeadroom()
 		var primed []byte
 		for pass := 0; pass < 2; pass++ {
 			for off := 0; off+step <= len(raw); off += step {
 				period := raw[off : off+step]
-				m, _ := pb.Process(period, -1, gain)
+				m, _ := pb.Process(period, -1, gain*ph)
 				o := pc.ProcessWithRef(m, pb.EchoRef(period))
 				if pass == 1 {
+					if ph < 1 {
+						rescale(o, 1/ph)
+					}
 					primed = append(primed, o...)
 				}
 			}
@@ -93,13 +98,22 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+	// The device's own order: the near end is extracted at the gain less the
+	// canceller's headroom, cancelled, then restored (client/data.go).
+	c.SetNearGain(int(math.Round(*gainDb)))
+	h := c.NearHeadroom()
 	for off := 0; off+step <= len(raw); off += step {
 		period := raw[off : off+step]
-		m, _ := bf.Process(period, -1, gain) // unlocked: ch6, as the wake stream
+		m, _ := bf.Process(period, -1, gain*h) // unlocked: ch6, as the wake stream
 		r := bf.EchoRef(period)
+		o := c.ProcessWithRef(m, r)
+		if h < 1 {
+			rescale(m, 1/h)
+			rescale(o, 1/h)
+		}
 		mic = append(mic, m...)
 		ref = append(ref, scale(r, *level)...)
-		speex = append(speex, c.ProcessWithRef(m, r)...)
+		speex = append(speex, o...)
 	}
 	if *save != "" {
 		b, err := c.ExportState()
@@ -116,6 +130,15 @@ func main() {
 		}
 	}
 	log.Printf("%s: %.1fs -> %s", *in, float64(len(mic))/2/rate, *out)
+}
+
+// rescale multiplies S16LE samples in place, clamped — the level restore
+// the mic goroutine does after cancelling at a headroom.
+func rescale(pcm []byte, factor float64) {
+	for i := 0; i+1 < len(pcm); i += 2 {
+		v := float64(int16(binary.LittleEndian.Uint16(pcm[i:]))) * factor
+		binary.LittleEndian.PutUint16(pcm[i:], uint16(int16(math.Max(-32768, math.Min(32767, v)))))
+	}
 }
 
 // scale applies the playback level to the reference the way aec does

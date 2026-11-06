@@ -162,6 +162,25 @@ func vadPeriodRMS(mono []byte) float64 {
 	return math.Sqrt(sum / float64(n))
 }
 
+// rescaleS16 multiplies a 16kHz mono S16LE buffer by factor in place, clamped
+// to int16, and returns how many samples the clamp caught. Used to restore
+// the configured mic gain after the canceller has run at a headroom.
+func rescaleS16(mono []byte, factor float64) uint64 {
+	var clipped uint64
+	for i := 0; i+1 < len(mono); i += 2 {
+		v := float64(int16(binary.LittleEndian.Uint16(mono[i:]))) * factor
+		if v > 32767 {
+			v = 32767
+			clipped++
+		} else if v < -32768 {
+			v = -32768
+			clipped++
+		}
+		binary.LittleEndian.PutUint16(mono[i:], uint16(int16(v)))
+	}
+	return clipped
+}
+
 // ─── DataClient ───────────────────────────────────────────────────────────────
 
 // Beam lock request states — see DataClient.beamReq.
@@ -989,6 +1008,7 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 	var seqNum uint16
 	var periodCount uint64 // periodic RMS diagnostic
 	var lastClipped uint64 // clip count at last diag line
+	var postClipped uint64 // samples clamped restoring the level after the canceller
 
 	// Memoized linear mic gain — recomputed only when the config dB value
 	// changes (config push mid-stream). Sentinel forces computation on the
@@ -1137,7 +1157,19 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 				gainDb = *snap.MicGainDb
 				gainLin = math.Pow(10, float64(gainDb)/20.0)
 				log.Printf("[data] mic gain: %ddB (linear %.2f)", gainDb, gainLin)
+				// The canceller sizes its near-end headroom from this gain
+				// and the playback level (aec.NearHeadroom).
+				d.aec.SetNearGain(gainDb)
 			}
+			// Near-end headroom: at high playback levels the +24dB mic gain
+			// would clip the speaker's echo at int16 before the canceller
+			// ever saw it, and a clipped near end is one no linear filter
+			// can cancel (speex also stops adapting on it). So the mic is
+			// extracted at gain × headroom, the canceller scales its
+			// reference by the same factor, and the level is restored
+			// below, after cancellation. 1 whenever the canceller is off or
+			// on the software tap; see the aec package for the numbers.
+			headroom := d.aec.NearHeadroom()
 
 			d.pipeMu.Lock()
 			// Consume any pending beam lock/unlock request from the control
@@ -1153,8 +1185,11 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 				d.beam.Unlock()
 			}
 
-			mono, angle := d.beam.Process(raw, beamAngle, gainLin)
+			mono, angle := d.beam.Process(raw, beamAngle, gainLin*headroom)
 			clipped := d.beam.ClippedSamples()
+			// The canceller keeps an echo path per mic; tell it which one
+			// this period came from (a lock or unlock just above moved it).
+			d.aec.SelectNear(d.beam.OutputChannel())
 
 			// AEC — subtract the speaker's own output before anything
 			// measures or gates the signal. No-op while aecEnabled=false.
@@ -1179,6 +1214,14 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 				mono = d.aec.ProcessWithRef(mono, echoRef)
 			} else {
 				mono = d.aec.Process(mono)
+			}
+			if headroom < 1 {
+				// Back to the configured gain. What clips HERE is residual
+				// the canceller left plus near-end speech louder than the
+				// gain allows — the same clamp as before, moved after the
+				// subtraction instead of before it. Counted apart from the
+				// beamformer's pre-cancellation clamp.
+				postClipped += rescaleS16(mono, 1/headroom)
 			}
 
 			// ── Processing pipeline ──────────────────────────────────────
@@ -1234,8 +1277,8 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 			// characterised — that job is done (2026-07-07 fleet
 			// analysis) and /tmp/server.log is RAM-backed and unrotated.
 			if periodCount%3750 == 0 || (clipped != lastClipped && periodCount%100 == 0) {
-				log.Printf("[data] VAD diag: rms=%.5f threshold=%.5f gain=%ddB clipped=%d gate=%v active=%v agc=%v",
-					rms, threshold*gainLin, gainDb, clipped, speech, active, agcEnabled)
+				log.Printf("[data] VAD diag: rms=%.5f threshold=%.5f gain=%ddB clipped=%d postclip=%d headroom=%.2f gate=%v active=%v agc=%v",
+					rms, threshold*gainLin, gainDb, clipped, postClipped, headroom, speech, active, agcEnabled)
 				lastClipped = clipped
 			}
 			periodCount++

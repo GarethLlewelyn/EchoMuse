@@ -136,6 +136,39 @@ The always-on wake stream (`mic_start` without `lock_mic`) is **ungated and AGC-
   17dB of hard clipping — which does not merely cancel badly, it teaches the
   filter a distorted echo path. Pinned by test.
 
+  **The near end clips at that gain too, above index ~100, and that was the
+  volume ceiling** (2026-09-24, a 2nd-gen Dot on Marvin). At index 110 the
+  `att=` line read `mic=13000` at +24dB — peaks past int16 — and at 127 the
+  RMS alone exceeds full scale; `extractChannel` clamps, speex freezes
+  adaptation on any frame with a sample at ±32000 (`mdf.c`, "arbitrary test
+  for saturation"), and cancellation fell from 12–16dB at index 70 to 0–6dB.
+  The loudspeaker's own THD at 127 is 1.5% (−36dB), so it was not the
+  speaker. `aec.NearHeadroom` is the part of `micGainDb` unity playback would
+  not tolerate — `micGainDb − (127 − level)·0.5dB`, floored at 0, so +24dB
+  starts giving way at index 79 — and the mic goroutine extracts at gain ×
+  headroom, the canceller scales its reference by the same factor, and the
+  level is restored after the subtraction (`rescaleS16`, counted as
+  `postclip=` on the VAD diag line). Both sides move together, so the filter
+  sees one echo path across every volume and the saved path still loads.
+  Hardware reference only; the software tap's reference is unscaled. `att=`
+  now prints `hr=` and its `mic=`/`out=`/`ref=` are at the canceller's scale.
+
+- **Per-mic echo paths and residual suppression** (2026-09-24, late, `internal/aec`). The beam lock hands the
+  canceller a different mic per turn and each mic hears the speaker through its own path (7 dB apart in gain on a
+  Dot, more in shape), so one filter re-learnt the path during every session's first reply (`att=1.2dB`, the reply
+  reached the controller as the user). `SelectNear(ch)` parks the filter under the channel it leaves and restores
+  the one parked under the channel it enters (`beamformer.OutputChannel`, called per period from data.go); the
+  paths are saved per mic beside the main file (`aec_echo_path.bin.chN`, first convergence past 12 dB, then daily)
+  and loaded at build. A mic never seen carries the current filter. A volume change still costs a second: the
+  paths are per mic, not per level. After the filter, speexdsp's preprocessor (`preprocess.c`, `filterbank.c`,
+  vendored from 1.2.1) runs on the cancelled frame with the echo state's own residual estimate: noise suppression
+  at 0 dB (bins the person owns keep a gain of one; the preprocessor only applies its gains with denoising on, so
+  that is on with its floor at 0), echo bins `aecResidualDb` (40) down, half that while the person talks over the
+  reply. On the bench that took the Echo's `att=` from 17–25 dB to 24–32 dB at index 110 and stopped Live's default
+  sensitivity from interrupting every reply; 0 turns it off. Its unit test measures +4.6 dB on a synthetic step;
+  speex's leak estimate reads an anti-correlated residual (a path that shrank) as none, so a step down is the
+  filter's alone.
+
   **The hardware has been handing us a sample-aligned reference all along, on
   Ch7/Ch8** (measured 2026-08-29 — see SETUP.md's Mic Array section). Those
   two channels are not unconnected mics: they are a stereo loopback of the

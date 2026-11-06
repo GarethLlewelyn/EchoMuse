@@ -26,10 +26,13 @@ package aec
 
 #include <stdlib.h>
 #include "speex/speex_echo.h"
+#include "speex/speex_preprocess.h"
 #include "src/fftwrap.c"
 #include "src/kiss_fft.c"
 #include "src/kiss_fftr.c"
 #include "src/mdf.c"
+#include "src/filterbank.c"
+#include "src/preprocess.c"
 */
 import "C"
 
@@ -175,7 +178,78 @@ type Canceller struct {
 	// SETS this volume, so it knows the scalar precisely.
 	refScale    float64
 	scaleWarned bool // one-shot guard for the unscaled-reference log
+
+	// Near-end headroom (2026-09-24). The mic goroutine applies micGainDb
+	// (+24dB by default) to the 24-bit capture and clamps to int16 BEFORE
+	// the near end reaches this canceller. That clamp is a hard non-linearity
+	// in the echo path: speex freezes adaptation on any frame holding a
+	// sample at ±32000 (mdf.c, "arbitrary test for saturation"), and a
+	// linear filter cannot predict a clipped waveform anyway. Measured on a
+	// 2nd-gen Dot: at index 110 the near end reads mic≈13000 RMS at +24dB,
+	// so peaks clip; at 127 the RMS alone exceeds full scale. Cancellation
+	// went from 12–16dB at index 70 to 0–6dB above ~100, and whole sentences
+	// of the device's own reply reached the controller as the user.
+	//
+	// The remedy is a matched scale on both inputs. The caller extracts the
+	// near end at micGainDb minus this headroom (NearHeadroom), the
+	// reference is scaled by the same factor here, and the caller restores
+	// the level after cancellation. The filter sees the same echo path
+	// whatever the headroom — W ∝ near/far and both moved together — so the
+	// saved echo path and convergence carry across volume changes as they
+	// did before.
+	//
+	// The headroom is the part of micGainDb that unity playback would not
+	// tolerate: k = micGainDb − (127 − level)·0.5dB, floored at 0. At +24dB
+	// it starts at index 79 and reaches the full 24dB at 127, holding the
+	// echo at the canceller near the −23dBFS RMS measured at unity gain and
+	// unity volume. Hardware reference only: the software tap's ring holds
+	// pre-change audio and its reference is not scaled at all.
+	level      int // last playback level told to us; -1 = unknown
+	nearGainDb int // micGainDb the caller applies at extraction
+	headroom   float64 // linear, ≤ 1; 1 = none
+
+	// Per-mic echo paths (2026-09-24). The beamformer hands over a different
+	// mic per turn: the centre mic between turns and, once a turn locks the
+	// beam, whichever perimeter mic faced the person. Each mic hears the
+	// loudspeaker through its own path, and on the bench (a 2nd-gen Dot,
+	// five sessions locking ch2, ch2, ch4, ch1, ch0) the paths differed by
+	// 7 dB in gain and enough in shape that a filter converged on one
+	// cancelled 1.2 dB on the next: every session's first reply re-learnt
+	// the path from nothing, and reached the controller as the person. So
+	// the learnt state is parked per channel when the near end moves and
+	// restored when that channel comes back (SelectNear). A channel never
+	// seen carries on with the current filter, which shares the loudspeaker
+	// and the converter delay with every other mic and starts closer than
+	// an empty one. The slots go with the filter on a rebuild (buildLocked):
+	// a parked state only loads into the shape it came from.
+	nearCh       int                // channel the near end comes from; -1 = not told yet
+	nearStates   map[int][]byte     // parked echo paths by channel (ExportState blobs)
+	lastNearSave map[int]time.Time // rate-limits the per-mic files (persist.go)
+
+	// Residual echo suppression (2026-09-24): speexdsp's preprocessor run
+	// on the cancelled frame with the echo state's own estimate of what it
+	// left behind (speex_echo_get_residual). Noise suppression is held at
+	// 0 dB so bins the person owns keep a gain of one; bins the residual
+	// owns go residualDb down, or half that while the person talks over
+	// the reply (the preprocessor's speech probability). What the linear
+	// filter leaves at a loud volume, -30 to -36 dBFS after 20 dB of
+	// cancellation at index 110 on the bench, still opened turns at Live's
+	// default start sensitivity; only a residual under the room's floor
+	// cannot. 0 turns it off (aecResidualDb in the config push).
+	pp         *C.SpeexPreprocessState
+	residualDb int
 }
+
+// DefaultResidualDb is the suppression depth the canceller starts with.
+const DefaultResidualDb = 40
+
+// maxNearCh is the highest mic channel the beamformer hands over: 0-5 are
+// the perimeter mics, 6 the centre.
+const maxNearCh = 6
+
+// nearHeadroomFloorLevel is the playback index below which a +24dB mic gain
+// needs no headroom: 127 − 24/0.5. Derived, not tuned — see the field note.
+const nearHeadroomFloorLevel = 127 - 24*2
 
 // SetPlaybackLevel tells the canceller the DAC volume index the reference has
 // not been through, so the hardware reference can be scaled to match what the
@@ -196,12 +270,67 @@ func (c *Canceller) SetPlaybackLevel(level int) {
 	scale := math.Pow(10, float64(level-127)/40.0)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.level = level
+	c.recomputeHeadroomLocked()
 	if scale == c.refScale {
 		return
 	}
 	c.refScale = scale
-	log.Printf("[aec] playback level %d → reference scale %.4f (%.1fdB)",
-		level, scale, 20*math.Log10(math.Max(scale, 1e-9)))
+	log.Printf("[aec] playback level %d → reference scale %.4f (%.1fdB), near-end headroom %.1fdB",
+		level, scale, 20*math.Log10(math.Max(scale, 1e-9)), c.headroomDbLocked())
+}
+
+// SetNearGain tells the canceller the digital gain (micGainDb) the caller
+// applies to the near end before handing it over, so the headroom can be
+// sized to what would otherwise clip. Called from the mic goroutine whenever
+// the configured gain changes.
+func (c *Canceller) SetNearGain(gainDb int) {
+	if gainDb < 0 {
+		gainDb = 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if gainDb == c.nearGainDb {
+		return
+	}
+	c.nearGainDb = gainDb
+	c.recomputeHeadroomLocked()
+	log.Printf("[aec] near-end gain %ddB → headroom %.1fdB at level %d",
+		gainDb, c.headroomDbLocked(), c.level)
+}
+
+// recomputeHeadroomLocked derives the near-end headroom from the mic gain
+// and the playback level. Unknown level (nothing told us yet) means none:
+// the reference is unscaled in that state too, and a headroom applied to
+// only one side would be a gain step in the echo path.
+func (c *Canceller) recomputeHeadroomLocked() {
+	c.headroom = 1
+	if c.level >= 0 && c.nearGainDb > 0 {
+		k := float64(c.nearGainDb) - float64(127-c.level)*0.5
+		if k > 0 {
+			c.headroom = math.Pow(10, -k/20)
+		}
+	}
+}
+
+func (c *Canceller) headroomDbLocked() float64 {
+	if c.headroom <= 0 || c.headroom >= 1 {
+		return 0
+	}
+	return 20 * math.Log10(c.headroom)
+}
+
+// NearHeadroom is the linear factor (≤ 1) the caller must apply to its
+// near-end extraction gain before ProcessWithRef, and divide the output by
+// afterwards. It is 1 unless the hardware reference is live, since only that
+// path scales the reference to match.
+func (c *Canceller) NearHeadroom() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.enabled || c.st == nil || !c.hwRef || c.headroom <= 0 {
+		return 1
+	}
+	return c.headroom
 }
 
 // SetHardwareRef selects the far-end source. True takes it from ch8 of the
@@ -286,7 +415,58 @@ func (c *Canceller) RefSource() string {
 
 // New returns a disabled Canceller. Call SetParams (config push) to arm it.
 func New() *Canceller {
-	return &Canceller{}
+	return &Canceller{level: -1, headroom: 1, nearCh: -1, residualDb: DefaultResidualDb}
+}
+
+// SetResidualSuppression sets how far residual echo is pushed below what the
+// linear filter leaves, in dB (0 turns the stage off, 60 is the ceiling).
+// Called on config push; the stage is rebuilt on the running filter.
+func (c *Canceller) SetResidualSuppression(db int) {
+	if db < 0 {
+		db = 0
+	}
+	if db > 60 {
+		db = 60
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if db == c.residualDb {
+		return
+	}
+	c.residualDb = db
+	c.buildPreprocessLocked()
+}
+
+// ResidualSuppression reports the depth in force, 0 when off.
+func (c *Canceller) ResidualSuppression() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.residualDb
+}
+
+// buildPreprocessLocked (re)creates the suppression stage against the
+// current echo state, or drops it when off. The preprocessor only applies
+// its gains with denoising on, so that is on with its floor at 0 dB.
+func (c *Canceller) buildPreprocessLocked() {
+	if c.pp != nil {
+		C.speex_preprocess_state_destroy(c.pp)
+		c.pp = nil
+	}
+	if c.st == nil || c.residualDb <= 0 {
+		return
+	}
+	c.pp = C.speex_preprocess_state_init(C.int(FrameSize), C.int(sampleRate))
+	on, off, zero := C.spx_int32_t(1), C.spx_int32_t(0), C.spx_int32_t(0)
+	echo, active := C.spx_int32_t(-c.residualDb), C.spx_int32_t(-c.residualDb/2)
+	C.speex_preprocess_ctl(c.pp, C.SPEEX_PREPROCESS_SET_ECHO_STATE, unsafe.Pointer(c.st))
+	C.speex_preprocess_ctl(c.pp, C.SPEEX_PREPROCESS_SET_DENOISE, unsafe.Pointer(&on))
+	C.speex_preprocess_ctl(c.pp, C.SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, unsafe.Pointer(&zero))
+	C.speex_preprocess_ctl(c.pp, C.SPEEX_PREPROCESS_SET_AGC, unsafe.Pointer(&off))
+	C.speex_preprocess_ctl(c.pp, C.SPEEX_PREPROCESS_SET_VAD, unsafe.Pointer(&off))
+	C.speex_preprocess_ctl(c.pp, C.SPEEX_PREPROCESS_SET_DEREVERB, unsafe.Pointer(&off))
+	C.speex_preprocess_ctl(c.pp, C.SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, unsafe.Pointer(&echo))
+	C.speex_preprocess_ctl(c.pp, C.SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE, unsafe.Pointer(&active))
+	log.Printf("[aec] residual echo suppression %ddB, %ddB while the person talks over it", c.residualDb, c.residualDb/2)
 }
 
 // SetParams applies config. On the software tap, any change to delay or tail
@@ -343,6 +523,7 @@ func (c *Canceller) SetParams(enabled bool, delayMs, tailMs int) {
 // use. What was learnt is discarded: it is worthless across a length change.
 func (c *Canceller) buildLocked() {
 	c.freeLocked()
+	c.nearStates = nil // parked for the old shape; they would not load into the new one
 	c.stTailMs = c.effectiveTailLocked()
 	tailSamples := C.int(c.stTailMs * sampleRate / 1000)
 	c.st = C.speex_echo_state_init(C.int(FrameSize), tailSamples)
@@ -353,6 +534,7 @@ func (c *Canceller) buildLocked() {
 	c.refBuf = (*C.spx_int16_t)(C.malloc(FrameSize * 2))
 	c.outBuf = (*C.spx_int16_t)(C.malloc(FrameSize * 2))
 	log.Printf("[aec] enabled: frame=%d tail=%dms delay=%dms", FrameSize, c.stTailMs, c.delayMs)
+	c.buildPreprocessLocked()
 }
 
 // seedRingLocked seeds the ring with the bulk delay as silence: the mic
@@ -368,6 +550,10 @@ func (c *Canceller) seedRingLocked() {
 }
 
 func (c *Canceller) freeLocked() {
+	if c.pp != nil {
+		C.speex_preprocess_state_destroy(c.pp)
+		c.pp = nil
+	}
 	if c.st != nil {
 		C.speex_echo_state_destroy(c.st)
 		c.st = nil
@@ -442,8 +628,9 @@ func (c *Canceller) WriteFar(period []byte) {
 
 // Process runs echo cancellation on one mic buffer: 16kHz mono S16LE, any
 // multiple of FrameSize samples. The mic ALSA reader does NOT deliver single
-// 512-sample periods — GoTinyAlsa's GetAudioStream reads pcm_get_buffer_size
-// per chunk (PeriodSize × PeriodCount = 2560 frames = 160ms), so the buffer
+// 512-sample periods — GoTinyAlsa's GetAudioStream delivers pcm_get_buffer_size
+// per chunk (PeriodSize × PeriodCount = 2560 frames = 160ms; since 2026-09-24
+// read one period at a time, but still handed over whole), so the buffer
 // arriving here is 5 speex frames long. The pre-2026-07-08 version of this
 // guard required exactly one frame and silently passed everything through —
 // AEC had therefore never processed a single sample on hardware (ring pegged
@@ -530,6 +717,12 @@ func (c *Canceller) process(mono, hwref []byte) []byte {
 			// that is (say) index 60, an unscaled reference is 33dB hot and
 			// cancellation collapses exactly as it did in round one.
 			scale := c.refScale
+			if scale > 0 && c.headroom > 0 && c.headroom < 1 {
+				// The caller extracted the near end at micGainDb minus the
+				// headroom (NearHeadroom); the reference goes down by the
+				// same factor so the filter sees an unchanged echo path.
+				scale *= c.headroom
+			}
 			if scale <= 0 {
 				scale = 1.0
 				if !c.scaleWarned {
@@ -573,6 +766,10 @@ func (c *Canceller) process(mono, hwref []byte) []byte {
 		}
 
 		C.speex_echo_cancellation(c.st, c.micBuf, c.refBuf, c.outBuf)
+		if c.pp != nil {
+			// In place on the cancelled frame, against the residual the filter just estimated.
+			C.speex_preprocess_run(c.pp, c.outBuf)
+		}
 		for i := 0; i < FrameSize; i++ {
 			binary.LittleEndian.PutUint16(out[off+i*2:], uint16(res[i]))
 		}
@@ -595,9 +792,11 @@ func (c *Canceller) process(mono, hwref []byte) []byte {
 					att = 20 * math.Log10(inAvg/outAvg)
 				}
 				if useHW {
+					// mic/out/ref are at the canceller's own scale: with a
+					// headroom in force they read hr dB below the stream.
 					log.Printf("[aec] att=%.1fdB mic=%.0f out=%.0f ref=%.0f "+
-						"src=hw(ch8) frames=%d",
-						att, inAvg, outAvg, refAvg, c.hwFrames)
+						"src=hw(ch8) near=ch%d hr=%.1fdB rs=%ddB frames=%d",
+						att, inAvg, outAvg, refAvg, c.nearCh, c.headroomDbLocked(), c.residualDb, c.hwFrames)
 					c.maybeSaveLocked(att, refAvg > 100)
 				} else {
 					log.Printf("[aec] att=%.1fdB mic=%.0f out=%.0f ref=%.0f ring=%d (delay=%dms)",
@@ -701,6 +900,19 @@ func (c *Canceller) ImportState(b []byte) error {
 }
 
 func (c *Canceller) importLocked(b []byte) error {
+	if err := c.checkLocked(b); err != nil {
+		return err
+	}
+	n := int(binary.LittleEndian.Uint32(b[len(stateMagic)+8:]))
+	if C.em_echo_state_import(c.st, unsafe.Pointer(&b[stateHeader]), C.int(n)) != 0 {
+		return errors.New("aec: import size mismatch")
+	}
+	return nil
+}
+
+// checkLocked is everything importLocked refuses, without the import: the
+// shape must be the running filter's and every value finite.
+func (c *Canceller) checkLocked(b []byte) error {
 	if c.st == nil {
 		return errors.New("aec: not enabled")
 	}
@@ -725,8 +937,55 @@ func (c *Canceller) importLocked(b []byte) error {
 			return errors.New("aec: saved echo path holds a non-finite value")
 		}
 	}
-	if C.em_echo_state_import(c.st, unsafe.Pointer(&b[stateHeader]), C.int(n)) != 0 {
-		return errors.New("aec: import size mismatch")
-	}
 	return nil
+}
+
+// SelectNear tells the canceller which mic channel the near end now comes
+// from. The same channel again is nothing. A change parks the current
+// filter under the old channel and restores the new channel's parked
+// filter if it has one; otherwise the current filter carries on as the new
+// channel's starting point. Called by the mic goroutine after every
+// beamformer period, so a lock or unlock takes effect on the first period
+// whose output it moved. Two 16KB copies per session; nothing per period
+// beyond the compare.
+func (c *Canceller) SelectNear(ch int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ch == c.nearCh {
+		return
+	}
+	prev := c.nearCh
+	c.nearCh = ch
+	if c.st == nil {
+		return // nothing learnt to park yet; the channel is remembered for when there is
+	}
+	if prev >= 0 {
+		if b, err := c.exportLocked(); err == nil {
+			if c.nearStates == nil {
+				c.nearStates = make(map[int][]byte)
+			}
+			c.nearStates[prev] = b
+		} else {
+			log.Printf("[aec] near end ch%d: its echo path could not be parked: %v", prev, err)
+		}
+	}
+	if b, ok := c.nearStates[ch]; ok {
+		if err := c.importLocked(b); err != nil {
+			log.Printf("[aec] near end now ch%d: parked echo path refused, carrying the current one: %v", ch, err)
+			return
+		}
+		log.Printf("[aec] near end now ch%d: restored its echo path", ch)
+		return
+	}
+	if prev >= 0 {
+		log.Printf("[aec] near end now ch%d: nothing learnt on it yet, carrying ch%d's path", ch, prev)
+	}
+}
+
+// NearChannel reports the channel the near end was last said to come from,
+// -1 until SelectNear has been called.
+func (c *Canceller) NearChannel() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nearCh
 }

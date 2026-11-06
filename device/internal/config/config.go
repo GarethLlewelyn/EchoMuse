@@ -104,6 +104,11 @@ type Device struct {
 	AecDelayMs int
 	AecTailMs  int
 
+	// AecResidualDb is how far the residual echo suppression stage after
+	// the canceller pushes what the linear filter leaves, in dB; 0 turns
+	// the stage off. See aec.Canceller.SetResidualSuppression.
+	AecResidualDb int
+
 	// AecRefSource picks where the far-end reference comes from: "auto",
 	// "hw" or "sw".
 	//
@@ -185,6 +190,7 @@ func (d *Device) loadDefaults() {
 	d.AecEnabled = &aecEnabled
 	d.AecDelayMs = envInt("AEC_DELAY_MS", 0)
 	d.AecTailMs = envInt("AEC_TAIL_MS", 300)
+	d.AecResidualDb = envInt("AEC_RESIDUAL_DB", 40)
 	// EM_AEC_HW_REF keeps working as the boot default for a device with no
 	// controller to push config, and is superseded the moment one does.
 	d.AecRefSource = normaliseAecRef(envStr("EM_AEC_HW_REF", AecRefAuto))
@@ -265,6 +271,9 @@ func (d *Device) Apply(msg ConfigMessage) {
 	if msg.AecTailMs > 0 {
 		d.AecTailMs = msg.AecTailMs
 	}
+	if msg.AecResidualDb != nil {
+		d.AecResidualDb = *msg.AecResidualDb
+	}
 	if msg.AecRefSource != "" {
 		d.AecRefSource = normaliseAecRef(msg.AecRefSource)
 	}
@@ -340,6 +349,7 @@ func (d *Device) Snapshot() ConfigMessage {
 		aecEnabled = *d.AecEnabled
 	}
 	aecDelayMs := d.AecDelayMs
+	aecResidualDb := d.AecResidualDb
 	bleProxyEnabled := false
 	if d.BleProxyEnabled != nil {
 		bleProxyEnabled = *d.BleProxyEnabled
@@ -363,6 +373,7 @@ func (d *Device) Snapshot() ConfigMessage {
 		AecEnabled:         &aecEnabled,
 		AecDelayMs:         &aecDelayMs,
 		AecTailMs:          d.AecTailMs,
+		AecResidualDb:      &aecResidualDb,
 		AecRefSource:       d.AecRefSource,
 		BleProxyEnabled:    &bleProxyEnabled,
 		ListeningAnim:      d.ListeningAnim,
@@ -423,6 +434,7 @@ type ConfigMessage struct {
 	AecEnabled         *bool    `json:"aecEnabled,omitempty"`
 	AecDelayMs         *int     `json:"aecDelayMs,omitempty"`
 	AecTailMs          int      `json:"aecTailMs,omitempty"`
+	AecResidualDb      *int     `json:"aecResidualDb,omitempty"`
 	AecRefSource       string   `json:"aecRefSource,omitempty"`
 	BleProxyEnabled    *bool    `json:"bleProxyEnabled,omitempty"`
 

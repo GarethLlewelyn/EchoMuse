@@ -145,6 +145,11 @@ type Beamformer struct {
 	// -1 means unlocked (use live best-direction selection).
 	lockedChannel int
 
+	// outputCh is the channel the last Process extracted: centreCh while
+	// unlocked, the locked or steered channel during a turn. The echo
+	// canceller keys its parked filters on it (aec.SelectNear).
+	outputCh int
+
 	// clippedSamples counts output samples clamped to int16 range by the
 	// mic gain in extractChannel. Only touched from the mic goroutine
 	// (Process and the diagnostics that read it) — no synchronisation.
@@ -162,7 +167,7 @@ type Beamformer struct {
 
 // New creates a Beamformer.
 func New() *Beamformer {
-	b := &Beamformer{lockedChannel: -1}
+	b := &Beamformer{lockedChannel: -1, outputCh: centreCh}
 	for ci := 0; ci < nDirections; ci++ {
 		b.chanBuf[ci] = make([]float32, periodFrames)
 		b.hfBuf[ci] = make([]float32, periodFrames)
@@ -322,6 +327,7 @@ func (b *Beamformer) Unlock() {
 // 12 o'clock), or -1 when unlocked.
 func (b *Beamformer) Process(raw []byte, steerAngle float64, gain float64) (mono []byte, angle float64) {
 	if len(raw) < periodFrames*frameSize {
+		b.outputCh = centreCh
 		return b.extractChannel(raw, centreCh, gain), -1
 	}
 
@@ -363,6 +369,7 @@ func (b *Beamformer) Process(raw []byte, steerAngle float64, gain float64) (mono
 	// Unlocked: always ch6 (omni). Covers OWW listening and disabled-beamforming
 	// voice turns. No directional bias, no channel splices.
 	if b.lockedChannel < 0 {
+		b.outputCh = centreCh
 		return b.extractChannel(raw, centreCh, gain), -1
 	}
 
@@ -386,8 +393,14 @@ func (b *Beamformer) Process(raw []byte, steerAngle float64, gain float64) (mono
 		angle = candidateAngles[bestDir]
 	}
 
+	b.outputCh = ch
 	return b.extractChannel(raw, ch, gain), angle
 }
+
+// OutputChannel is the ALSA channel the last Process extracted: the centre
+// mic while unlocked, the locked (or steered) perimeter mic during a turn.
+// The echo canceller keeps a filter per channel keyed on it (aec.SelectNear).
+func (b *Beamformer) OutputChannel() int { return b.outputCh }
 
 // hfEnergy returns the mean squared HF energy for direction di.
 // hfChannels is indexed 0–5 by direction (matching decodeChannels output),
